@@ -42,7 +42,6 @@ Estrutura das páginas
 
 CSS3
 
-
 Estilização e responsividade
 
 
