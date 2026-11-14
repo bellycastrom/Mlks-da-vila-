@@ -404,7 +404,7 @@ def init_db():
         con.executescript("""
         CREATE TABLE IF NOT EXISTS participantes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nome TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            nome TEXT NOT NULL COLLATE NOCASE,
             turma TEXT NOT NULL DEFAULT '',
             criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
@@ -448,10 +448,48 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_atividades_data ON atividades(data);
         CREATE INDEX IF NOT EXISTS idx_emprestimos_ativos ON emprestimos(livro_id, devolvido_em);
         """)
+        migrate_participant_names(con)
+
+
+def migrate_participant_names(con):
+    """Atualiza o esquema legado preservando IDs e vínculos com outras tabelas."""
+    row = con.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='participantes'"
+    ).fetchone()
+    if not row or "UNIQUE" not in row["sql"].upper():
+        return
+
+    # PRAGMA foreign_keys só pode ser alterado fora de transação ativa.
+    con.commit()
+    con.execute("PRAGMA foreign_keys = OFF")
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("""
+            CREATE TABLE participantes_novos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nome TEXT NOT NULL COLLATE NOCASE,
+                turma TEXT NOT NULL DEFAULT '',
+                criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        con.execute("""
+            INSERT INTO participantes_novos(id, nome, turma, criado_em)
+            SELECT id, nome, turma, criado_em FROM participantes
+        """)
+        con.execute("DROP TABLE participantes")
+        con.execute("ALTER TABLE participantes_novos RENAME TO participantes")
+        if con.execute("PRAGMA foreign_key_check").fetchone():
+            raise sqlite3.IntegrityError("Migração interrompida: referência inválida")
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.execute("PRAGMA foreign_keys = ON")
 
 
 def get_people(con):
-    return con.execute("SELECT id,nome,turma FROM participantes ORDER BY nome COLLATE NOCASE").fetchall()
+    return con.execute("SELECT id,nome,turma FROM participantes ORDER BY nome COLLATE NOCASE, turma COLLATE NOCASE, id").fetchall()
 
 
 def fmt_date(iso: str) -> str:
@@ -550,7 +588,7 @@ def activity_form(con, token: str, values: dict | None = None, selected: set[int
     rows = "".join(
         f'''<tr class="person-row"><td class="center">{i}</td>
 <td><label class="person-label"><input type="checkbox" name="presentes" value="{p['id']}" {"checked" if p['id'] in selected else ""}>
-<span>{e(p['nome'])}</span></label></td><td><span class="state-label {"state-present" if p['id'] in selected else "state-absent"}">{"Presente" if p['id'] in selected else "Ausente"}</span></td></tr>'''
+<span>{e(p['nome'])}<small class="row-description">Turma: {e(p['turma'] or 'Não informada')} · Cadastro #{p['id']}</small></span></label></td><td><span class="state-label {"state-present" if p['id'] in selected else "state-absent"}">{"Presente" if p['id'] in selected else "Ausente"}</span></td></tr>'''
         for i, p in enumerate(people, 1)
     ) if people else '<tr><td colspan="3" class="empty-row">Nenhum participante cadastrado. <a href="/participantes">Cadastre participantes</a> antes de registrar a atividade.</td></tr>'
     count = len(selected)
@@ -575,13 +613,13 @@ def activity_form(con, token: str, values: dict | None = None, selected: set[int
 
 
 def activity_detail(con, activity, *, just_saved: bool = False) -> str:
-    roster = con.execute('''SELECT p.nome, p.id, i.presente FROM inscricoes i JOIN participantes p ON p.id=i.participante_id
-                             WHERE i.atividade_id=? ORDER BY p.nome COLLATE NOCASE''', (activity['id'],)).fetchall()
+    roster = con.execute('''SELECT p.nome, p.turma, p.id, i.presente FROM inscricoes i JOIN participantes p ON p.id=i.participante_id
+                             WHERE i.atividade_id=? ORDER BY p.nome COLLATE NOCASE, p.turma COLLATE NOCASE, p.id''', (activity['id'],)).fetchall()
     n = len(roster)
     present = sum(row['presente'] for row in roster)
     absent = n - present
     done = bool(activity['presenca_registrada'])
-    rows = ''.join(f'''<tr><td class="center">{k}</td><td>{e(p['nome'])}</td>
+    rows = ''.join(f'''<tr><td class="center">{k}</td><td>{e(p['nome'])}<small class="row-description">Turma: {e(p['turma'] or 'Não informada')} · Cadastro #{p['id']}</small></td>
 <td class="status-cell"><span class="presence-result {"present" if p['presente'] else "absent" if done else "pending"}">{icon("check-circle" if p['presente'] else "x-circle" if done else "info", size=15)}
 <span>{"Presente" if p['presente'] else "Ausente" if done else "Pendente"}</span></span></td></tr>'''
         for k,p in enumerate(roster,1)) or '<tr><td colspan="3" class="empty-row">Esta atividade não tem participantes registrados.</td></tr>'
@@ -625,7 +663,7 @@ def activity_listing(con, token: str) -> str:
 
 def people_page(con, token: str) -> str:
     people = get_people(con)
-    rows = ''.join(f'''<tr><td>{e(p['nome'])}</td><td>{e(p['turma'] or '—')}</td>
+    rows = ''.join(f'''<tr><td>{e(p['nome'])}<small class="row-description">Cadastro #{p['id']}</small></td><td>{e(p['turma'] or '—')}</td>
 <td class="actions-cell"><form method="post" action="/participantes/{p['id']}/excluir" data-confirm="Excluir este participante? Só é possível remover quem não possui atividades ou empréstimos vinculados.">{csrf_input(token)}<button type="submit" class="icon-btn danger" aria-label="Excluir {e(p['nome'])}">{icon('trash',size=17)}</button></form></td></tr>''' for p in people)
     if not rows:
         rows = '<tr><td colspan="3" class="empty-row">Nenhum participante cadastrado. Cadastre pessoas para registrar as presenças.</td></tr>'
@@ -643,15 +681,15 @@ def library_page(con, token: str) -> str:
     books = con.execute('''SELECT l.*, (SELECT COUNT(*) FROM emprestimos x WHERE x.livro_id=l.id AND x.devolvido_em IS NULL) emprestados
                            FROM livros l ORDER BY l.titulo COLLATE NOCASE''').fetchall()
     people = get_people(con)
-    active_loans = con.execute('''SELECT x.id, x.retirado_em,p.nome participante,l.titulo livro
+    active_loans = con.execute('''SELECT x.id, x.retirado_em, x.participante_id, p.nome participante, p.turma, l.titulo livro
                                   FROM emprestimos x JOIN livros l ON l.id=x.livro_id JOIN participantes p ON p.id=x.participante_id
                                   WHERE x.devolvido_em IS NULL ORDER BY x.retirado_em DESC''').fetchall()
     books_rows = ''.join(f'''<tr><td><strong>{e(b['titulo'])}</strong><small class="row-description">{e(b['autor'])} · {e(b['categoria'])}</small></td>
 <td>{b['quantidade']}</td><td>{b['quantidade']-b['emprestados']}</td></tr>''' for b in books) or '<tr><td class="empty-row" colspan="3">Nenhum livro cadastrado.</td></tr>'
-    loan_rows = ''.join(f'''<tr><td>{e(x['livro'])}<small class="row-description">{e(x['participante'])}</small></td>
+    loan_rows = ''.join(f'''<tr><td>{e(x['livro'])}<small class="row-description">{e(x['participante'])} · {e(x['turma'] or 'Sem turma')} · Cadastro #{x['participante_id']}</small></td>
 <td>{e(fmt_date(x['retirado_em']))}</td><td class="actions-cell"><form method="post" action="/biblioteca/emprestimos/{x['id']}/devolver">{csrf_input(token)}<button type="submit" class="btn btn-outline btn-small">{icon('return',size=15)} Devolver</button></form></td></tr>''' for x in active_loans) or '<tr><td colspan="3" class="empty-row">Nenhum empréstimo em aberto.</td></tr>'
     book_select = '<option value="">Selecione um livro</option>' + ''.join(f'<option value="{b["id"]}" {"disabled" if b["quantidade"] <= b["emprestados"] else ""}>{e(b["titulo"])} — {b["quantidade"]-b["emprestados"]} disponível(is)</option>' for b in books)
-    people_select = '<option value="">Selecione um participante</option>' + ''.join(f'<option value="{p["id"]}">{e(p["nome"])}</option>' for p in people)
+    people_select = '<option value="">Selecione um participante</option>' + ''.join(f'<option value="{p["id"]}">{e(p["nome"])} · {e(p["turma"] or "Sem turma")} · Cadastro #{p["id"]}</option>' for p in people)
     return f'''{breadcrumbs("Biblioteca")}
 {section_header("Biblioteca","Consulte o acervo, registre empréstimos e acompanhe devoluções.")}
 <div class="two-col library-grid"><section class="panel"><h2>Cadastrar livro</h2>
@@ -790,10 +828,7 @@ class Handler(BaseHTTPRequestHandler):
                 name, group = form_val(form,'nome'), form_val(form,'turma')
                 if not (1 <= len(name) <= 120) or len(group) > 80:
                     return self.show(path,people_page(con,self.csrf),'Participantes',error='Informe um nome válido, com até 120 caracteres.')
-                try:
-                    con.execute('INSERT INTO participantes(nome,turma) VALUES (?,?)',(name,group))
-                except sqlite3.IntegrityError:
-                    return self.show(path,people_page(con,self.csrf),'Participantes',error='Este participante já está cadastrado.')
+                con.execute('INSERT INTO participantes(nome,turma) VALUES (?,?)',(name,group))
                 return self.redirect('/participantes?ok=1')
             if match := re.fullmatch(r'/participantes/(\d+)/excluir',path):
                 pid = int(match.group(1))
