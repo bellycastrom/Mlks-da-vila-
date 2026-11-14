@@ -1,0 +1,24 @@
+# Bases locais e possíveis dados pessoais: nunca versionar.
+dados/*.db
+dados/*.sqlite
+dados/*.sqlite3
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Artefatos Python e testes
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Configurações locais
+.env
+.env.*
+!.env.example
